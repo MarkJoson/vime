@@ -14,6 +14,7 @@ import requests
 from vllm.utils.system_utils import kill_process_tree
 
 from vime.ray.ray_actor import RayActor
+from vime.utils.common import is_npu
 from vime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,10 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
-    env["CUDA_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
+    if is_npu():
+        env["ASCEND_RT_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
