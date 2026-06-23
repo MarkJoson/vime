@@ -59,6 +59,12 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     args = server_args_dict["_args"]
     env = os.environ.copy()
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # [NPU] Drop a parent-inherited PYTORCH_NPU_ALLOC_CONF (the Docker image sets
+    # expandable_segments:True for training). vllm-ascend manages this itself and
+    # MUST NOT have expandable_segments under sleep mode — its CaMemAllocator
+    # memory pool asserts against it (camem.py). Let vllm-ascend's own
+    # sleep-mode-aware logic (platform.py) re-add it only when sleep mode is off.
+    env.pop("PYTORCH_NPU_ALLOC_CONF", None)
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     if is_npu():
         env["ASCEND_RT_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
@@ -329,7 +335,14 @@ class VLLMEngine(RayActor):
     def set_weight_version(self, new_version: str):
         self._weight_version = str(new_version)
 
-    def release_memory_occupation(self, level: int = 2):
+    def release_memory_occupation(self, level: int | None = None):
+        # [NPU] vllm-ascend level=2 sleep discards weights; the subsequent wake_up then
+        # re-allocates them as plain tensors WITHOUT vLLM's ``weight_loader`` attribute,
+        # breaking the RLHF weight update ('Parameter' object has no attribute
+        # 'weight_loader'). Default to level=1 on NPU (offload weights to host, keep the
+        # param objects) while CUDA keeps the upstream level=2 default.
+        if level is None:
+            level = 1 if is_npu() else 2
         self.flush_cache()
         response = requests.post(f"http://{self.server_host}:{self.server_port}/sleep", params={"level": level})
         response.raise_for_status()
