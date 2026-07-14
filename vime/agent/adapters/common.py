@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -105,6 +106,28 @@ def render_token_ids(chain: AdapterChain, tokenizer) -> list[int]:
     return list(ids)
 
 
+def trim_chain_to_max_context(chain: AdapterChain, tokenizer, max_context_tokens: int) -> list[int]:
+    """Drop oldest non-system messages until the rendered prompt fits the context cap.
+
+    Keeps the newest turns and preserves system messages when present. Returns the
+    final rendered token ids and mutates ``chain.chat_messages`` in place.
+    """
+    prompt_ids = render_token_ids(chain, tokenizer)
+    if max_context_tokens <= 0 or len(prompt_ids) <= max_context_tokens:
+        return prompt_ids
+
+    while len(prompt_ids) > max_context_tokens and len(chain.chat_messages) > 1:
+        drop_index = 0
+        if isinstance(chain.chat_messages[0], dict) and chain.chat_messages[0].get("role") == "system":
+            drop_index = 1
+        if drop_index >= len(chain.chat_messages):
+            break
+        del chain.chat_messages[drop_index]
+        prompt_ids = render_token_ids(chain, tokenizer)
+
+    return prompt_ids
+
+
 def request_session_id(
     request: web.Request,
     *,
@@ -197,6 +220,31 @@ def _vllm_sampling_body(sp: dict) -> dict:
     return body
 
 
+def _truncate_for_log(value: Any, limit: int = 2000) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "...<truncated>"
+    return text
+
+
+
+def _request_debug_summary(prompt_ids: list[int], payload: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    sampling_params = payload.get("sampling_params") if isinstance(payload, dict) else {}
+    return {
+        "session_id": session_id,
+        "prompt_tokens": len(prompt_ids),
+        "max_tokens": sampling_params.get("max_tokens") if isinstance(sampling_params, dict) else None,
+        "temperature": sampling_params.get("temperature") if isinstance(sampling_params, dict) else None,
+        "top_p": sampling_params.get("top_p") if isinstance(sampling_params, dict) else None,
+        "top_k": sampling_params.get("top_k") if isinstance(sampling_params, dict) else None,
+        "stop_count": len(sampling_params.get("stop", [])) if isinstance(sampling_params, dict) and isinstance(sampling_params.get("stop"), list) else (1 if isinstance(sampling_params, dict) and sampling_params.get("stop") else 0),
+        "has_stop_token_ids": bool(isinstance(sampling_params, dict) and sampling_params.get("stop_token_ids")),
+    }
+
+
 def _tokens_and_logprobs_from_choice(choice: dict) -> tuple[list[int], list[float]]:
     """Parse ``token_ids`` + ``logprobs.content[i].logprob`` from a vLLM
     ``/inference/v1/generate`` choice. Mirrors vime ``_inference_generate_tokens_and_logprobs``."""
@@ -250,6 +298,9 @@ async def call_vllm_generate(
         "token_ids": list(prompt_ids),
         "sampling_params": _vllm_sampling_body(sp),
     }
+    request_url = f"{vllm_url}/inference/v1/generate"
+    debug_summary = _request_debug_summary(prompt_ids, payload, session_id)
+    logger.info("[%s] request -> %s summary=%s", log_prefix, request_url, _truncate_for_log(debug_summary, 800))
     # session_id routes via vllm-router's consistent_hash policy (x-session-id header);
     # see vime ``vllm_rollout.py`` headers handling.
     headers = {"x-session-id": session_id} if session_id and session_id != "default" else None
@@ -257,24 +308,76 @@ async def call_vllm_generate(
     task = asyncio.current_task()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
-            f"{vllm_url}/inference/v1/generate",
+            request_url,
             json=payload,
             headers=headers,
         ) as r:
             if r.status >= 400:
                 text = await r.text()
+                logger.error(
+                    "[%s] upstream HTTP %s session=%s body=%s request=%s",
+                    log_prefix,
+                    r.status,
+                    session_id,
+                    _truncate_for_log(text, 4000),
+                    _truncate_for_log(payload, 4000),
+                )
                 raise RuntimeError(f"vllm upstream {r.status}: {text[:400]}")
             data = await r.json(content_type=None)
         choice = (data.get("choices") or [{}])[0]
         output_ids, output_log_probs = _tokens_and_logprobs_from_choice(choice)
         fr = choice.get("finish_reason")
         finish = fr if isinstance(fr, str) and fr else "stop"
-    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError):
+        logger.info(
+            "[%s] response <- %s session=%s finish=%s output_tokens=%d has_logprobs=%s",
+            log_prefix,
+            request_url,
+            session_id,
+            finish,
+            len(output_ids),
+            bool(output_log_probs),
+        )
+    except asyncio.CancelledError:
+        logger.exception(
+            "[%s] cancelled error session=%s request=%s",
+            log_prefix,
+            session_id,
+            _truncate_for_log(payload, 3000),
+        )
         # vLLM ``/inference/v1/generate`` has no per-request HTTP abort endpoint.
         # Cancelling the in-flight task tears down the aiohttp request, which drops
         # the streaming connection so vLLM stops generating.
         if task is not None:
             task.cancel()
+        raise
+    except aiohttp.ClientError:
+        logger.exception(
+            "[%s] client transport error session=%s request=%s",
+            log_prefix,
+            session_id,
+            _truncate_for_log(payload, 3000),
+        )
+        if task is not None:
+            task.cancel()
+        raise
+    except asyncio.TimeoutError:
+        logger.exception(
+            "[%s] socket timeout error session=%s request=%s",
+            log_prefix,
+            session_id,
+            _truncate_for_log(payload, 3000),
+        )
+        if task is not None:
+            task.cancel()
+        raise
+    except Exception:
+        logger.error(
+            "[%s] unexpected generate error session=%s request=%s traceback=%s",
+            log_prefix,
+            session_id,
+            _truncate_for_log(payload, 3000),
+            traceback.format_exc(),
+        )
         raise
 
     return TurnRecord(

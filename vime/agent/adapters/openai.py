@@ -24,7 +24,7 @@ from vime.agent.adapters.common import ADAPTER_KEY, REASONING_PARSER_KEY, TOKENI
 from vime.agent.adapters.common import AdapterChain as Chain
 from vime.agent.adapters.common import BaseAdapter, call_vllm_generate
 from vime.agent.adapters.common import json_arguments as _json_arguments
-from vime.agent.adapters.common import ok_response, render_token_ids, request_session_id
+from vime.agent.adapters.common import ok_response, render_token_ids, request_session_id, trim_chain_to_max_context
 from vime.agent.adapters.common import stable_hash as _hash
 from vime.agent.parsing import ParsedModelOutput, parse_model_output
 from vime.agent.trajectory import TokenSegment, TurnRecord, TurnSegment, make_turn_segment, merge_turn_segments
@@ -55,6 +55,7 @@ class OpenAIAdapter(BaseAdapter):
         )
         self.app.router.add_post("/v1/chat/completions", _handle_chat_completions)
         self.app.router.add_post("/v1/responses", _handle_responses)
+        self.app.router.add_get("/health", _ok)
         self.app.router.add_get("/healthz", _ok)
         self.app.router.add_get("/v1/models", _ok)
 
@@ -273,8 +274,10 @@ def _extend_chat_messages(target: Chain, messages: list[dict], tools_schema: lis
         target.tools_schema = tools_schema
 
 
-def _build_prompt(target: Chain, messages: list[dict], tools_schema: list[dict] | None, kind: str, tok) -> list[int]:
+def _build_prompt(target: Chain, messages: list[dict], tools_schema: list[dict] | None, kind: str, tok, max_context_tokens: int = 0) -> list[int]:
     (_extend_chat_messages if kind == "append" else _replace_chat_messages)(target, messages, tools_schema)
+    if max_context_tokens > 0:
+        return trim_chain_to_max_context(target, tok, max_context_tokens)
     return render_token_ids(target, tok)
 
 
@@ -372,7 +375,11 @@ async def _run_turn(
     if sid in adapter.closed:
         raise web.HTTPServiceUnavailable(text="session closed")
     app = request.app
-    s = adapter.store.setdefault(sid, Session())
+    s = adapter.store.get(sid)
+    if s is None:
+        s = Session()
+        s.max_context_tokens = int(getattr(adapter, "max_context_tokens", 0) or 0)
+        adapter.store[sid] = s
     task = asyncio.current_task()
     adapter.inflight.setdefault(sid, set()).add(task)
     try:
@@ -380,7 +387,7 @@ async def _run_turn(
             target = s.main
             tools_schema = _normalize_tools(body.get("tools"))
             kind = _select_kind(s, messages)
-            prompt_ids = _build_prompt(target, messages, tools_schema, kind, app[TOKENIZER_KEY])
+            prompt_ids = _build_prompt(target, messages, tools_schema, kind, app[TOKENIZER_KEY], s.max_context_tokens)
             turn = await _generate(prompt_ids, s, body, app, session_id=sid)
             parsed = _parse_turn(target, turn, app)
             target.turns.append(turn)
@@ -397,25 +404,48 @@ async def _handle_chat_completions(request: web.Request) -> web.StreamResponse:
     turn, parsed, in_tok, out_tok = await _run_turn(request, body, messages)
     if body.get("stream"):
         return await _stream_chat_completion(request, body, parsed, turn.finish_reason, in_tok, out_tok)
-    return web.json_response(_chat_completion_response(body, parsed, turn.finish_reason, in_tok, out_tok))
+    return web.json_response(
+        _chat_completion_response(body, parsed, turn, turn.finish_reason, in_tok, out_tok, request.app[TOKENIZER_KEY])
+    )
 
 
 def _chat_completion_response(
     body: dict,
     parsed: ParsedModelOutput,
+    turn: TurnRecord,
     finish: str,
     in_tok: int,
     out_tok: int,
+    tokenizer,
 ) -> dict[str, Any]:
+    message = _chat_message(parsed)
+    if isinstance(message, dict):
+        if turn.output_ids:
+            message["token_ids"] = list(turn.output_ids)
+        if turn.prompt_ids:
+            message["input_token_ids"] = list(turn.prompt_ids)
+
     return {
         "id": f"chatcmpl_{secrets.token_hex(12)}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": body.get("model", "vime-actor"),
+        "prompt_token_ids": list(turn.prompt_ids),
         "choices": [
             {
                 "index": 0,
-                "message": _chat_message(parsed),
+                "message": message,
+                "token_ids": list(turn.output_ids),
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": tokenizer.decode([token_id], skip_special_tokens=False),
+                            "token_id": token_id,
+                            "logprob": float(logprob),
+                        }
+                        for token_id, logprob in zip(turn.output_ids, turn.output_log_probs, strict=False)
+                    ]
+                },
                 "finish_reason": _finish_reason(parsed, finish),
             }
         ],
@@ -449,20 +479,36 @@ async def _stream_chat_completion(
             "object": "chat.completion.chunk",
             "created": created,
             "model": body.get("model", "vime-actor"),
+            "prompt_token_ids": list(turn.prompt_ids),
             "choices": [{"index": 0, "delta": choice_delta, "finish_reason": finish_reason}],
         }
         if usage is not None:
             chunk["usage"] = usage
         await out.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
 
-    await emit({"role": "assistant"})
+    await emit({"role": "assistant", "input_token_ids": list(turn.prompt_ids)})
     if parsed.reasoning:
         await emit({"reasoning_content": parsed.reasoning})
     if parsed.text:
-        await emit({"content": parsed.text})
+        await emit({"content": parsed.text, "token_ids": list(turn.output_ids)})
     for idx, call in enumerate(_openai_tool_calls(parsed.tool_uses)):
         await emit({"tool_calls": [{**call, "index": idx}]})
-    await emit({}, finish_reason=_finish_reason(parsed, finish), usage=_usage(in_tok, out_tok))
+    await emit(
+        {
+            "logprobs": {
+                "content": [
+                    {
+                        "token": request.app[TOKENIZER_KEY].decode([token_id], skip_special_tokens=False),
+                        "token_id": token_id,
+                        "logprob": float(logprob),
+                    }
+                    for token_id, logprob in zip(turn.output_ids, turn.output_log_probs, strict=False)
+                ]
+            }
+        },
+        finish_reason=_finish_reason(parsed, finish),
+        usage=_usage(in_tok, out_tok),
+    )
     await out.write(b"data: [DONE]\n\n")
     return out
 

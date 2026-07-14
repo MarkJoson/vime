@@ -30,6 +30,7 @@ from vime.agent.adapters.common import (
     ok_response,
     render_token_ids,
     request_session_id,
+    trim_chain_to_max_context,
 )
 from vime.agent.adapters.common import stable_hash as _hash
 from vime.agent.parsing import parse_model_output
@@ -266,9 +267,11 @@ def _extend_chat_messages(target: Chain, body: dict) -> None:
         target.tools_schema = _anthropic_tools_to_chat_tools(body.get("tools"))
 
 
-def _build_prompt(target: Chain, body: dict, kind: str, tok) -> list[int]:
+def _build_prompt(target: Chain, body: dict, kind: str, tok, max_context_tokens: int = 0) -> list[int]:
     """Replace/extend chat_messages and render input ids for vLLM."""
     (_extend_chat_messages if kind == "append" else _replace_chat_messages)(target, body)
+    if max_context_tokens > 0:
+        return trim_chain_to_max_context(target, tok, max_context_tokens)
     return render_token_ids(target, tok)
 
 
@@ -377,7 +380,7 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     try:
         async with s.lock:  # same sid -> serialized
             target, is_sub, kind = _select_chain(s, body)
-            ideal_ids = _build_prompt(target, body, kind, app[TOKENIZER_KEY])
+            ideal_ids = _build_prompt(target, body, kind, app[TOKENIZER_KEY], s.max_context_tokens)
             turn = await _generate(ideal_ids, s, body, app, session_id=sid)
             blocks, stop, did = _build_reply(target, turn.output_ids, turn.finish_reason, app)
             target.turns.append(turn)

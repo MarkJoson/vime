@@ -1,10 +1,12 @@
 import logging
+import os
 import time
 import traceback
 from pathlib import Path
 
 import torch
 
+from vime.utils.common import is_npu
 from vime.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,12 @@ class TrainProfiler:
             and (rollout_id == s - 1)
         ):
             self._memory_profiler_overall.stop()
+
+    def capture_oom(self, **context):
+        if self._memory_profiler_overall is not None:
+            self._memory_profiler_overall.capture_oom(context=context)
+            return
+        print_memory(_format_oom_message("when oom", context))
 
     def iterate_train_actor(self, iterator):
         return _profile_simple_loop(iterator, self.args, name="train_actor")
@@ -78,6 +86,23 @@ def _create_torch_profiler(args, name):
     )
 
 
+def _safe_rank():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return "na"
+
+
+def _sanitize_path_part(value):
+    return str(value).replace(os.sep, "-").replace(" ", "_").replace(":", "-")
+
+
+def _format_oom_message(prefix, context):
+    if not context:
+        return prefix
+    items = [f"{k}={v}" for k, v in context.items() if v is not None]
+    return f"{prefix} ({', '.join(items)})" if items else prefix
+
+
 class _BaseMemoryProfiler:
     @staticmethod
     def create(args):
@@ -88,9 +113,16 @@ class _BaseMemoryProfiler:
         return c(args)
 
     def __init__(self, args):
-        self._path_dump = (
-            Path(args.memory_snapshot_dir)
-            / f"memory_snapshot_time{time.time()}_rank{torch.distributed.get_rank()}_{args.memory_snapshot_path}"
+        self.args = args
+        self._path_dir = Path(args.memory_snapshot_dir)
+        self._path_dir.mkdir(parents=True, exist_ok=True)
+        self._path_name = getattr(args, "memory_snapshot_path", None) or "memory_snapshot.pickle"
+        self._path_dump = self._build_path("final")
+        self._oom_dump_path = None
+
+    def _build_path(self, tag):
+        return self._path_dir / (
+            f"memory_snapshot_{tag}_time{time.time()}_pid{os.getpid()}_rank{_safe_rank()}_{_sanitize_path_part(self._path_name)}"
         )
 
     def start(self):
@@ -98,33 +130,83 @@ class _BaseMemoryProfiler:
 
     def stop(self):
         raise NotImplementedError
+
+    def _dump_snapshot(self, path):
+        raise NotImplementedError
+
+    def capture_oom(self, context=None, observer_payload=None):
+        if self._oom_dump_path is not None:
+            logger.info(f"OOM diagnostics already dumped to {self._oom_dump_path}")
+            return self._oom_dump_path
+
+        self._oom_dump_path = self._build_path("oom")
+        logger.error(
+            _format_oom_message(
+                f"Observe OOM, will dump snapshot to {self._oom_dump_path}.",
+                context,
+            )
+        )
+        if observer_payload is not None:
+            logger.error(f"OOM observer payload: {observer_payload!r}")
+        traceback.print_stack()
+        print_memory(_format_oom_message("when oom", context))
+        try:
+            self._dump_snapshot(self._oom_dump_path)
+        except Exception:
+            logger.exception(f"Failed to dump memory snapshot to {self._oom_dump_path}")
+        return self._oom_dump_path
 
 
 class _TorchMemoryProfiler(_BaseMemoryProfiler):
     def start(self):
         logger.info("Attach OOM dump memory history.")
 
+        if is_npu():
+            torch.npu.memory._record_memory_history(
+                max_entries=1000000,
+                stacks="all",
+            )
+
+            try:
+                import torch_npu
+
+                def oom_observer(*observer_payload):
+                    self.capture_oom(
+                        context={"backend": "npu", "stage": "oom_observer"},
+                        observer_payload=observer_payload,
+                    )
+
+                torch_npu._C._npu_attach_out_of_memory_observer(oom_observer)
+            except Exception:
+                logger.exception("Failed to attach NPU OOM observer")
+            return
+
         torch.cuda.memory._record_memory_history(
             max_entries=1000000,
-            # record stack information for the trace events
-            # trace_alloc_record_context=True,
             stacks="all",
         )
 
         def oom_observer(device, alloc, device_alloc, device_free):
-            logger.info(
-                f"Observe OOM, will dump snapshot to {self._path_dump}. ({device=} {alloc=} {device_alloc=} {device_free=}; stacktrace is as follows)"
+            self.capture_oom(
+                context={"backend": "cuda", "device": device},
+                observer_payload=(alloc, device_alloc, device_free),
             )
-            traceback.print_stack()
-            torch.cuda.memory._dump_snapshot(self._path_dump)
-            print_memory("when oom")
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
+    def _dump_snapshot(self, path):
+        if is_npu():
+            torch.npu.memory._dump_snapshot(str(path))
+            return
+        torch.cuda.memory._dump_snapshot(str(path))
+
     def stop(self):
         logger.info(f"Dump memory snapshot to: {self._path_dump}")
-        torch.cuda.memory._dump_snapshot(self._path_dump)
-        torch.cuda.memory._record_memory_history(enabled=None)
+        self._dump_snapshot(self._path_dump)
+        if is_npu():
+            torch.npu.memory._record_memory_history(enabled=None)
+        else:
+            torch.cuda.memory._record_memory_history(enabled=None)
 
 
 class _MemrayMemoryProfiler(_BaseMemoryProfiler):

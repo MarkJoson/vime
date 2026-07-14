@@ -452,11 +452,20 @@ class MegatronTrainRayActor(TrainRayActor):
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
-        if self.role == "critic":
-            result = self.train_critic(rollout_id, rollout_data)
-        else:
-            self.train_actor(rollout_id, rollout_data, external_data=external_data)
-            result = None
+        try:
+            if self.role == "critic":
+                result = self.train_critic(rollout_id, rollout_data)
+            else:
+                self.train_actor(rollout_id, rollout_data, external_data=external_data)
+                result = None
+        except torch.OutOfMemoryError:
+            self.prof.capture_oom(
+                role=self.role,
+                rollout_id=rollout_id,
+                stage="train_dispatch",
+                local_rank=os.environ.get("LOCAL_RANK"),
+            )
+            raise
 
         if self.args.offload_train:
             del rollout_data
@@ -585,16 +594,25 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
+            try:
+                with timer("actor_train"):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                    )
+            except torch.OutOfMemoryError:
+                self.prof.capture_oom(
+                    role=self.role,
+                    rollout_id=rollout_id,
+                    stage="actor_train",
+                    local_rank=os.environ.get("LOCAL_RANK"),
                 )
+                raise
 
             self.prof.step(rollout_id=rollout_id)
 
