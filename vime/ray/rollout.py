@@ -177,15 +177,18 @@ class ServerGroup:
         ]
         return init_handles, port_cursors
 
-    def offload(self):
+    def offload(self, level: int | None = None):
         """Fire release_memory_occupation on all engines (non-blocking).
 
+        ``level=None`` lets each engine fall back to ``--rollout-sleep-level``.
         Returns a list of Ray ObjectRefs.  Skipped for groups that do not
         overlap with megatron GPUs (``needs_offload=False``).
         """
         if not self.needs_offload:
             return []
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        return [
+            engine.release_memory_occupation.remote(level=level) for engine in self.engines if engine is not None
+        ]
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
@@ -293,7 +296,10 @@ class RolloutServer:
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
             if g.needs_offload and dead_indices:
                 new_engines = [g.all_engines[i] for i in dead_indices]
-                release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
+                # Explicit level=1: a recovered engine just loaded correct weights
+                # from disk, and the resume below restores them from the host
+                # backup — level 2 would discard the only up-to-date copy.
+                release_handles.extend(engine.release_memory_occupation.remote(level=1) for engine in new_engines)
                 if self.update_weights:
                     updatable_new_engines.extend(new_engines)
                 elif g.model_path:
@@ -314,10 +320,17 @@ class RolloutServer:
                 )
 
     def offload(self):
-        """Release memory occupation across all groups (concurrent)."""
+        """Release memory occupation across all groups (concurrent).
+
+        Sleep level 2 discards weights, counting on the post-train
+        ``update_weights`` IPC pass to refill them — that pass only reaches
+        updatable servers, so non-updatable ones (fixed teacher/RM engines)
+        are pinned to level 1 regardless of ``--rollout-sleep-level``.
+        """
+        level = None if self.update_weights else 1
         handles = []
         for g in self.server_groups:
-            handles.extend(g.offload())
+            handles.extend(g.offload(level))
         return ray.get(handles) if handles else []
 
     def onload(self, tags: list[str] | None = None):
@@ -330,10 +343,13 @@ class RolloutServer:
     def onload_weights(self):
         """Restore weights for offloaded groups.
 
-        All groups resume from CPU cache via ``resume_memory_occupation``.
-        For updatable servers, weights will be overwritten by
-        ``update_weights`` shortly after.  For non-updatable servers the
-        CPU backup already contains the correct (unchanged) weights.
+        Under sleep level 1 the groups resume from the host backup via
+        ``resume_memory_occupation`` — for updatable servers that copy-back is
+        immediately overwritten by ``update_weights``, which is the redundant
+        full h2d that ``--rollout-sleep-level 2`` exists to skip: level 2 wakes
+        into uninitialized weight buffers and the IPC pass fills them.  For
+        non-updatable servers the host backup is the only weight source, which
+        is why ``offload()`` pins them to level 1.
         """
         handles = []
         for g in self.server_groups:

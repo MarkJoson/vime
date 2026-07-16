@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Qwen3.5-9B · DAPO-Math GRPO RL · Ascend 910B3 全 8 卡 · 出效果
-# TP2 × DP4 (8卡), vLLM per-engine 2卡(TP2, 4 engines), 32k 响应长度, util 0.7。
+# TP4 × CP2 (8卡, 纯DP=1), vLLM per-engine 2卡(TP2, 4 engines), 32k 响应长度, util 0.7。
 # storage-resize B 全卸(param+grad, rollout 残留逼近0) → 给 vLLM 32k KV 腾显存。
 # wandb: 本机 cntrain21 localhost:8080。
 # =============================================================================
@@ -16,11 +16,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export SLIME_SCRIPT_TRAIN_BACKEND=megatron
-# storage-resize hook(npu_mem_offload)放 PYTHONPATH 最前 → 注入 NPUWeightOffloader storage-resize。
-# committed offloader 的 _release_ddp_buffers 是假卸载(reassign,不真释放),offload 后 used 不降 →
-# vLLM wake_up 分配 31GB KV cache 时 OOM。hook 用 storage().resize_(0) 真释放 DDP flat buffer。
-# 此前误判"hook 多 step 死锁"实为 CP ring crash(已在 actor.py 修)。B 模式已在 210652 跑通完整 rollout。
-export PYTHONPATH="/workspace/vime/scripts/npu_mem_offload:/workspace/Megatron-Bridge-slime/src:/workspace/Megatron-LM/:/workspace/vime:$PYTHONPATH"
+# storage-resize offload 已内置 vime/utils/npu_weight_offloader.py(此前经
+# scripts/npu_mem_offload 的 PYTHONPATH hook 注入,B 模式在 210652 跑通完整 rollout 后收编)。
+export PYTHONPATH="/workspace/Megatron-Bridge-slime/src:/workspace/Megatron-LM/:/workspace/vime:$PYTHONPATH"
 export VIME_OFFLOAD_PARAM_BUFFER=1   # B: param+grad 全卸, rollout 残留逼近0
 
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -145,7 +143,6 @@ python ${VIME_DIR}/train.py \
   --wandb-project vime-dapo-math-9b \
   --wandb-group qwen35-9b-8card \
   \
-  --train-memory-margin-bytes 2147483648 \
   --distributed-timeout-minutes 60 \
   2>&1 | tee "${RUN_ROOT}/run.log"
 

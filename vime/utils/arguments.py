@@ -97,6 +97,21 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "This will always be true when --colocate is set."
                 ),
             )
+            parser.add_argument(
+                "--rollout-sleep-level",
+                type=int,
+                default=1,
+                choices=[1, 2],
+                help=(
+                    "vLLM sleep level used by --offload-rollout. 1 (default): weights are "
+                    "backed up to host on sleep and copied back on wake — safe everywhere. "
+                    "2: weights are discarded on sleep and wake into uninitialized buffers, "
+                    "skipping the host backup and the wake h2d copy; the update_weights IPC "
+                    "pass right after must fill them (updatable engines only). Depends on the "
+                    "colocate worker extension's weight_loader re-patch; not yet "
+                    "regression-tested on NPU."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="hccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)

@@ -110,22 +110,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if args.offload_train:
             if is_npu():
-                # [storage-resize] The default NPUWeightOffloader._release_ddp_buffers swaps
-                # param_data/grad_data to empty tensors, but Megatron's bucket views still alias
-                # the original storage, so the DDP flat buffers (grad_data fp32 + param_data bf16,
-                # ~13GB/rank for 9B/TP4) are NOT freed — leaving too little HBM for vLLM's KV
-                # cache on wake_up (OOM: aclrtMallocPhysical at camem_allocator). Patch
-                # offload/onload to verl-style storage().resize_(0) which frees the shared storage.
-                # Done here, NOT via the npu_mem_offload sitecustomize hook, because importing the
-                # hook at interpreter startup runs before torch is ready ("operator prims::sum does
-                # not exist"); by this point torch/torch_npu are fully initialised.
-                # B-mode (param+grad) via env VIME_OFFLOAD_PARAM_BUFFER=1.
-                try:
-                    import storage_resize_hook
-
-                    storage_resize_hook.patch_offloader(NPUWeightOffloader)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"storage-resize patch unavailable, using default offloader: {e}")
+                # NPUWeightOffloader releases the Megatron DDP flat buffers via
+                # storage().resize_(0) — grad always, param too under
+                # VIME_OFFLOAD_PARAM_BUFFER=1 (B mode, required for colocate).
+                # Design notes and the fake-offload history live in
+                # vime/utils/npu_weight_offloader.py; the former runtime patch
+                # (scripts/npu_mem_offload) is built in now.
                 self._weight_offloader = NPUWeightOffloader()
                 logger.info("NPU weight offloader initialised for rollout-stage actor offload")
             else:

@@ -880,18 +880,29 @@ class VLLMEngine(RayActor):
             )
         return self._weight_version
 
-    def release_memory_occupation(self, level: int = 1):
+    def release_memory_occupation(self, level: int | None = None):
         """Flush prefix cache, then ``POST /sleep?level={level}``.
 
-        Default level=1 (offload weights to host, keep the param objects) NOT level=2.
-        On NPU (vllm-ascend), level=2 sleep discards weights and the subsequent
-        wake_up re-allocates them as plain tensors WITHOUT vllm's ``weight_loader``
-        attribute, breaking the RLHF weight update (`'Parameter' object has no
-        attribute 'weight_loader'`). Level 1 preserves the param objects (and thus
-        weight_loader) while still freeing GPU HBM for colocated training.
+        ``level`` defaults to ``--rollout-sleep-level`` (1 unless overridden).
+
+        Level 1: weights are offloaded to a host copy and copied back on
+        ``wake_up(tags=[weights])``. Param objects survive, so this works
+        everywhere — but each cycle pays a full weights h2d copy plus the host
+        backup, both wasted for updatable engines whose weights get overwritten
+        by the IPC update right after.
+
+        Level 2: weights are discarded on sleep (no host backup) and wake_up
+        allocates uninitialized buffers, relying on the subsequent
+        ``update_weights`` IPC pass to fill them. The historical NPU blocker —
+        vllm-ascend re-creating params WITHOUT vllm's ``weight_loader`` attr,
+        breaking the weight update — is compensated by the colocate worker
+        extension (``start_weight_update`` re-patches captured param attrs).
+        Not yet regression-tested end to end on NPU; default stays 1.
         """
         if self.node_rank != 0:
             return None
+        if level is None:
+            level = getattr(self.args, "rollout_sleep_level", None) or 1
         self.flush_cache()
         response = requests.post(
             f"{self._http_base()}/sleep",
